@@ -405,6 +405,7 @@ def test_commands():
         "We're done.": "done", "Exit, we're done.": "done", "We're down here.": "done",
         "Okay Claude, we're done for now.": "done", "Claude Dunn.": "done", "Exit.": "done",
         "Quit.": "done", "That's all, thanks.": "done", "Alright, I think we're done here.": "done",
+        "We're done. We're done.": "done", "We're done. Exit.": "done", "Exit. Exit.": "done",
         "Claude, don't talk.": "quiet", "cloth, don't talk.": "quiet", "Close. Don't talk.": "quiet",
         "Don't talk.": "quiet", "Okay, stop talking please.": "quiet",
         "Claude, talk.": "talk", "Cloth, talk to me.": "talk",
@@ -414,7 +415,8 @@ def test_commands():
         # prompts, not commands
         "Done.": None, "Talk.": None, "Now explain the code.": None, "We're done with the parser, now the tests.": None,
         "Close the file and run the tests.": None, "Exit the loop when the list is empty.": None,
-        "We're down to two failing tests.": None, "Please list the files in this directory.": None,
+        "We're down to two failing tests.": None, "Done. Exit the loop.": None,
+        "We're done. Now the tests.": None, "Please list the files in this directory.": None,
     }
     for said, want in cases.items():
         got = match_command(said)

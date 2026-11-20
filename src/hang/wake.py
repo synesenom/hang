@@ -73,7 +73,7 @@ def match_folder(said):
 def wake_target(text):
     """Folder to open for this utterance, or None if it is not a wake phrase."""
     said = audio.addressed(text or "")
-    if not said or audio.is_done(*audio.command_core(text)):  # "Claude, done" is meant for a session
+    if not said or audio.says_done(text):  # "Claude, done" is meant for a session
         return None
     if said in LISTEN:
         return WAKE_DIR

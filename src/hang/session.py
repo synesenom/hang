@@ -41,7 +41,7 @@ import tty
 
 from hang import ROOT, audio
 from hang.hook import PHASES
-from hang.audio import (HALLUCINATIONS, command_core, is_done, Listener, Recorder, addressed, live_sessions,
+from hang.audio import (HALLUCINATIONS, command_core, says_done, Listener, Recorder, addressed, live_sessions,
                          load_verifier, log, normalize, sound, transcribe)
 
 MODE = os.environ.get("HANG_MODE", "handsfree").lower()
@@ -121,7 +121,7 @@ def match_command(text):
     core, named = command_core(text)
     if not core:
         return None
-    if is_done(core, named):
+    if says_done(text):
         return "done"
     if core in QUIET_UNNAMED or (named and core in QUIET):
         return "quiet"

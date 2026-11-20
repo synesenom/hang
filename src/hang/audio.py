@@ -230,6 +230,19 @@ def is_done(core, named=False):
     return first in ("exit", "quit", "close") and (rest in DONE or rest in DONE_NAMED)
 
 
+def says_done(text):
+    """Does this utterance ask to exit Claude Code? Also when the phrase is
+    repeated or combined ("We're done. We're done.", "We're done. Exit."): every
+    sentence must then be a done phrase on its own."""
+    core, named = command_core(text)
+    if is_done(core, named):
+        return True
+    if not core:  # too long (or empty) to be a command
+        return False
+    parts = [p for p in re.split(r"[.!?;]+", text) if normalize(p)]
+    return len(parts) > 1 and all(is_done(*command_core(p)) for p in parts)
+
+
 def write_wav(pcm):
     fd, path = tempfile.mkstemp(prefix="vc-", suffix=".wav")
     os.close(fd)
