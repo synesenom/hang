@@ -1,0 +1,7 @@
+⏺ You picked Apple and Cherry for fruits, and Large for size.
+✻ Brewed for 4s · done 1:07 PM
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Please rename the parser and
+  run the tests
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ plan mode on (shift+tab to cycle) · ← for agents                                      ◐ medium · /effort

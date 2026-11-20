@@ -1,7 +1,10 @@
 """The `hang` command line (Click + rich), run by ./hang.
 
-`./hang` alone does whatever is still needed: set up, train your voice, start
-the background service; then shows the status and what to say.
+  ./hang         on: set up whatever is missing, train your voice the first time,
+                 listen in the background now and at every login; show the status
+  ./hang off     off: stop listening, and don't start at login
+  ./hang talk    Claude Code in this folder, by voice
+  ./hang train   retrain your voice, then try it out
 """
 import os
 import sys
@@ -56,6 +59,10 @@ def _status(console):
     english = audio.LANG == "en" and os.path.exists(audio.LANGID_MODEL)
     grid.add_row("English only", "[green]✓ on[/]" if english else "[grey62]off[/]")
 
+    from hang import autostart
+    grid.add_row("At login", "[green]✓ starts by itself[/]" if autostart.enabled() else
+                 "[grey62]○ doesn't start by itself (HANG_LOGIN=0)[/]")
+
     state = wake.state()
     grid.add_row("Background", {
         "listening": "[green]● listening[/] [grey62]for “Claude, <folder>”[/]",
@@ -69,12 +76,14 @@ def _status(console):
     say.add_column("What happens", style="grey70")
     folders = wake.folders()[:5]
     for f in folders:
-        say.add_row("“Claude, %s”" % _spoken(f), "opens Claude Code in ~/Desktop/%s" % f)
+        say.add_row("“Claude, %s”" % _spoken(f), "opens Claude Code in ~/Desktop/%s, where you left off" % f)
     say.add_row("[grey62]in a session:[/]", "")
     say.add_row("anything, then a 1 s pause", "sends it to Claude")
     say.add_row("… “amm” before the pause", "waits: keep talking, it is added to the prompt")
-    say.add_row("“stop”", "interrupts Claude")
-    say.add_row("“option one / two / three”", "answers a permission prompt")
+    say.add_row("“stop”", "interrupts Claude (or its talking)")
+    say.add_row("“option two” / “yes” / your own words", "answers a question, permission or plan")
+    say.add_row("“plan mode” / “accept edits”", "switches Claude Code's mode")
+    say.add_row("“say that again” / “read me the whole answer”", "hear it again, or in full")
     say.add_row("“Claude, don't talk” / “Claude, talk”", "spoken updates off / on")
     say.add_row("“How is it going?”", "says what Claude is doing right now")
     say.add_row("“We're done” / “exit”", "exits Claude Code and closes the window")
@@ -133,8 +142,9 @@ def _train(console, start_service=True):
 def cli(ctx):
     """Talk to Claude Code by voice; audio never leaves your computer.
 
-    Run it without a command to set up (or repair), train your voice if needed,
-    start listening in the background and see the status.
+    Without a command: turn it on. Sets up whatever is missing, trains your
+    voice the first time, listens in the background now and at every login,
+    and shows the status. `hang off` turns it off.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -149,15 +159,23 @@ def cli(ctx):
             console.print("  [yellow]⚠[/] continuing without voice recognition; train later with ./hang train")
     if not _start_service(console):
         sys.exit(1)
+    from hang import autostart
+    if os.environ.get("HANG_LOGIN", "1") != "0" and not autostart.enabled():
+        autostart.enable()
+        console.print("  [green]✓[/] starts by itself when you log in [grey62](./hang off to stop)[/]")
     _status(console)
 
 
 @cli.command()
-@click.option("--no-start", is_flag=True, help="Don't start the background service afterwards.")
+@click.option("--check", "check_only", is_flag=True, help="Only try out your current voiceprint, live.")
 @click.option("--reset", is_flag=True, help="Delete your voiceprint instead (any voice is accepted again).")
-def train(no_start, reset):
-    """Read a passage aloud so only your voice is accepted."""
+def train(check_only, reset):
+    """Retrain your voice, then try it out."""
+    from hang import wake
     console = _console()
+    if check_only:
+        _banner(console)
+        sys.exit(0 if _check(console) else 1)
     if reset:
         from hang import speaker, wake
         if speaker.forget():
@@ -168,11 +186,14 @@ def train(no_start, reset):
             console.print("  [grey62]· there was no voiceprint[/]")
         return
     _banner(console)
-    sys.exit(0 if _train(console, start_service=not no_start) else 1)
+    if not _train(console, start_service=wake.running()):
+        sys.exit(1)
+    if _interactive():
+        console.print("\n  Now try it: say a few sentences and see whether each is recognized as you.")
+        _check(console)
 
 
-@cli.command()
-def check():
+def _check(console):
     """Talk and see, phrase by phrase, whether it's recognized as you."""
     import queue
     import threading
@@ -182,12 +203,10 @@ def check():
     from rich.table import Table
     from hang import audio, speaker
 
-    console = _console()
-    _banner(console)
     verifier = speaker.Verifier.load()
     if not verifier:
         console.print("  [yellow]⚠[/] no voiceprint yet; run ./hang train first")
-        sys.exit(1)
+        return False
     rows, clips = [], queue.Queue()
 
     def worker():
@@ -225,20 +244,32 @@ def check():
             pass
         finally:
             listener.stop()
+    return True
+
+
+@cli.command(hidden=True)
+def start():
+    """Start the background listening, nothing else (run at login)."""
+    console = _console()
+    sys.exit(0 if _start_service(console) else 1)
 
 
 @cli.command()
 def off():
-    """Stop the background listening (`hang` starts it again)."""
-    from hang import wake
+    """Turn it off: stop listening, also at login."""
+    from hang import autostart, wake
     console = _console()
-    console.print("  [green]✓[/] stopped" if wake.stop() else "  [grey62]· it wasn't running[/]")
+    stopped, unhooked = wake.stop(), autostart.disable()
+    console.print("  [green]✓[/] off: not listening, and won't start at login" if stopped or unhooked else
+                  "  [grey62]· it was already off[/]")
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_interspersed_args": False})
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def talk(claude_args):
-    """Open Claude Code here and talk to it (extra arguments go to claude)."""
+    """Claude Code here, by voice, where you left off.
+
+    Extra arguments go to claude."""
     from hang import session
     session.main(claude_args)
 

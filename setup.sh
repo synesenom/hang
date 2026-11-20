@@ -40,9 +40,10 @@ if ! command -v poetry >/dev/null; then
 fi
 ok "Poetry $(poetry --version 2>/dev/null | sed 's/.*version //; s/)//')"
 
-step "Installing Python packages (sherpa-onnx, numpy, click, rich) into .venv"
+step "Installing Python packages (sherpa-onnx, numpy, click, rich, pyte) into .venv"
 run poetry env use "$PY" || fail "poetry could not create the environment"
 run poetry install --no-root || fail "poetry install failed"
+touch .venv/.hang-installed
 ok "Python packages"
 chmod +x hang
 

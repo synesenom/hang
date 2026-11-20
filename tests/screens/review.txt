@@ -1,0 +1,9 @@
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Fruits  ☒ Size  ✔ Submit  →
+Review your answers
+ ● Which fruits?
+   → Apple, Cherry
+ ● Which size?
+   → Large
+❯ 1. Submit answers
+  2. Cancel

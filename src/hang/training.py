@@ -222,7 +222,7 @@ def run(console):
                 import wave
                 with wave.open(wav) as w:
                     seconds = w.getnframes() / w.getframerate()
-                emb = speaker.embed(ex, speaker.read_wav(wav)) if seconds >= MIN_CLIP_S else None
+                emb = speaker.embed(ex, speaker.trim(speaker.read_wav(wav))) if seconds >= MIN_CLIP_S else None
                 text = audio.transcribe(wav)  # deletes the WAV
             except Exception as e:  # keep training going
                 audio.log("training sample failed: %s" % e)

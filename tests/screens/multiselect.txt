@@ -1,0 +1,15 @@
+❯ Ask me two questions.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Fruits  ☐ Size  ✔ Submit  →
+Which fruits?
+❯ 1. [✔] Apple
+         Select apple
+  2. [ ] Banana
+         Select banana
+  3. [✔] Cherry
+         Select cherry
+  4. [ ] Type something
+     Next
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

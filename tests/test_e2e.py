@@ -9,14 +9,17 @@ spoken feedback. No mic needed; nothing touches your real voiceprint or service.
 Each test runs in its own process with its own temp folder, several at once, and
 the test audio is replayed faster than real time (HANG_TEST_RATE).
 """
+import fcntl
 import json
 import os
 import pty
 import re
 import select
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,6 +82,8 @@ def spawn_talk(name, wav, **extra):
     env = env_for(name, wav, **extra)
     pid, fd = pty.fork()
     if pid == 0:
+        # A wide terminal, like a real one: dialogs are drawn without wrapping.
+        fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
         os.execve(HANG, [HANG, "talk"], env)
     read_until(fd, b"\x1b]0;claude", 20)  # ready once it sets the window title
     return pid, fd, env["HANG_LOG"]
@@ -167,6 +172,33 @@ def test_amm():
     return failures, logf
 
 
+def test_live():
+    """A long sentence is typed while it is still being said, then fixed up to the
+    final transcript and sent; short ones (could be commands) only at the end."""
+    failures = []
+    sentence = ("Please look through the parser module and tell me why the tests about empty lines "
+                "keep failing on the build server.")
+    wav = speech_wav("live", [0.8, sentence, 2.0, "Send it.", 2.0])
+    pid, fd, logf = spawn_talk("live", wav, HANG_TEST_RATE="1")
+    out = read_until(fd, b"server. \r\n", 40) + read_until(fd, None, 3)
+    finish(pid, fd, failures)
+    log = log_of(logf)
+    lines = log.splitlines()
+    live_at = [i for i, l in enumerate(lines) if "typing live" in l]
+    final_at = [i for i, l in enumerate(lines) if "transcribed in" in l and "parser" in l]
+    if "whisper server ready" not in log:
+        failures.append("the whisper server did not start")
+    if not live_at or not final_at or live_at[0] > final_at[0]:
+        failures.append("not typed while still talking")
+    if "fixed up to the final" not in log:
+        failures.append("live text not fixed up at the end")
+    if b"build server. \r\n" not in out.lower():
+        failures.append("final sentence not sent as typed: %r" % out[-400:])
+    if len(live_at) > 1:
+        failures.append("'Send it.' was typed live")
+    return failures, logf
+
+
 def test_english_only():
     """Speech in another language is dropped, short phrases too; commands are kept."""
     failures = []
@@ -252,8 +284,6 @@ for line in sys.stdin:
     tool("Bash", {"command": "pytest"})
     reply = "I looked at it.\n\nVoice summary: Found three files, all fine."
     subprocess.run(hook("Stop"), shell=True, input=json.dumps({"last_assistant_message": reply}), text=True)
-    subprocess.run(hook("Notification"), shell=True, text=True,
-                   input=json.dumps({"message": "Claude is waiting for your input"}))
     print("REPLIED", flush=True)
 """
 
@@ -298,6 +328,169 @@ def test_speak():
     return failures, logf
 
 
+SCREENS = os.path.join(ROOT, "tests", "screens")  # real Claude Code dialogs, as seen by hang.screen
+
+FAKE_DIALOG_CLAUDE = r"""#!/usr/bin/env python3
+# Stands in for Claude Code showing dialogs: draws a real dialog screen, prints
+# the keys it gets, then draws the next one.
+import os, select, sys, tty
+tty.setraw(0)
+def show(name):
+    lines = open(os.path.join(os.environ["SCREENS"], name + ".txt")).read().splitlines()
+    sys.stdout.write("\x1b[2J\x1b[H" + "\r\n".join(lines) + "\r\n")
+    sys.stdout.flush()
+def keys(until):
+    got = b""
+    while not any(u in got for u in until):
+        if not select.select([0], [], [], 60)[0]:
+            break
+        got += os.read(0, 1024)
+    sys.stdout.write("\x1b[2J\x1b[HGOT %r\r\n" % got)
+    sys.stdout.flush()
+for name, until in [("question", [b"1", b"2"]), ("permission", [b"\x13"]), ("plan", [b"1", b"2", b"3"]),
+                    ("trust", [b"\r"])]:
+    show(name)
+    keys(until)
+print("FINISHED", end="\r\n", flush=True)
+"""
+
+
+def test_choices():
+    """Dialogs are read off the screen and answered by voice: "Option two"
+    presses 2, your own words on a permission prompt close it and are sent
+    instead, "Approve manually" picks that option, "Yes" trusts a folder."""
+    failures = []
+    bindir = os.path.join(TMP, "fakebin-dialogs")
+    os.makedirs(bindir)
+    with open(os.path.join(bindir, "claude"), "w") as f:
+        f.write(FAKE_DIALOG_CLAUDE)
+    os.chmod(os.path.join(bindir, "claude"), 0o755)
+    wav = speech_wav("choices", [2.0, "Option two.", 3.0, "No, move it to the archive folder instead.", 3.0,
+                                 "Approve manually.", 3.0, "Yes, I trust it.", 2.0])
+    pid, fd, logf = spawn_talk("choices", wav, HANG_CMD="claude", HANG_SPEAK="0", SCREENS=SCREENS,
+                               PATH=bindir + os.pathsep + fake_bin() + os.pathsep + os.environ["PATH"])
+    out = read_until(fd, b"FINISHED", 60)
+    finish(pid, fd, failures)
+    got = re.findall(rb"GOT (.*?)\r\n", out)
+    if len(got) != 4:
+        failures.append("fake claude did not get four answers: %r" % got)
+        return failures, logf
+    if got[0] != b"b'2'":
+        failures.append("'Option two' did not press 2: %s" % got[0])
+    second = got[1].decode().lower()
+    if not (second.startswith("b'\\x1b") and "no, move it to the archive folder instead" in second):
+        failures.append("own words on a permission prompt: %s" % got[1])
+    if got[2] != b"b'2'":
+        failures.append("'Approve manually' did not press 2: %s" % got[2])
+    if got[3] != b"b'\\x1b[B\\r'":
+        failures.append("'Yes, I trust it' did not move down and confirm: %s" % got[3])
+    log = log_of(logf)
+    for kind in ("question", "permission", "plan", "trust"):
+        if "dialog: %s" % kind not in log:
+            failures.append("%s dialog not recognized" % kind)
+    return failures, logf
+
+
+def test_dialogs():
+    """Real Claude Code dialogs (tests/screens) are parsed, read out and answered."""
+    from hang.screen import Screen, parse_menu
+    from hang import dialogs
+    failures = []
+    menus = {n[:-4]: parse_menu(open(os.path.join(SCREENS, n)).read().splitlines()) for n in os.listdir(SCREENS)}
+    kinds = {"question": "question", "multiselect": "question", "permission": "permission", "plan": "plan",
+             "trust": "trust", "review": "review", "prompt": None}
+    for name, kind in kinds.items():
+        got = menus[name] and menus[name].kind
+        if got != kind:
+            failures.append("%s: kind %r, expected %r" % (name, got, kind))
+    screen = Screen(120, 45)
+    screen.feed("\r\n".join(open(os.path.join(SCREENS, "plan.txt")).read().splitlines()).encode())
+    plan = screen.plan_text()
+    screen = Screen(110, 45)
+    screen.feed("\r\n".join(open(os.path.join(SCREENS, "prompt.txt")).read().splitlines()).encode())
+    if (screen.mode(), screen.input_text()) != ("plan mode", "Please rename the parser and run the tests"):
+        failures.append("mode / input box: %r %r" % (screen.mode(), screen.input_text()))
+    said = {
+        "question": "Which size? Option one: Small. Option two: Large. Pick one, or just tell me.",
+        "multiselect": "Which fruits? Option one: Apple. Option two: Banana. Option three: Cherry. "
+                       "Pick any, then say next. Or just tell me.",
+        "plan": "The plan is ready: Create hello.txt in the working directory with the Write tool, 2 steps. "
+                "Say approve, or approve manually, or read me the plan, or tell me what to change.",
+    }
+    for name, want in said.items():
+        got = dialogs.announce(menus[name], plan)
+        if got != want:
+            failures.append("announce %s: %r" % (name, got))
+    K = lambda b: [("keys", b)]
+    typed = lambda row, text: K(row) + [("wait", 0.3), ("keys", text), ("wait", 0.2), ("keys", b"\r")]
+    cases = [
+        ("question", "Large.", K(b"2")), ("question", "Option two.", K(b"2")), ("question", "The first one.", K(b"1")),
+        ("question", "Option two, large.", K(b"2")),
+        ("question", "Medium, but only if it fits.", typed(b"3", b"Medium, but only if it fits.")),
+        ("question", "Option one, but tiny.", typed(b"3", b"Small, but tiny")),
+        ("question", "Stop.", K(b"\x1b")),
+        ("multiselect", "Banana and cherry.", K(b"1") + [("wait", 0.15)] + K(b"2") + [("wait", 0.15), ("wait", 0.2)]
+         + K(b"\t")),
+        ("multiselect", "Next.", K(b"\t")),
+        ("permission", "Yes.", K(b"1")), ("permission", "Yes, always.", K(b"2")), ("permission", "No.", K(b"4")),
+        ("permission", "No, move it to the archive instead.",
+         K(b"\x1b") + [("wait", 0.5), ("prompt", "No, move it to the archive instead.")]),
+        ("permission", "Option one, but keep a backup.", K(b"1") + [("wait", 0.5), ("prompt", "but keep a backup")]),
+        ("plan", "Approve.", K(b"1")), ("plan", "Approve manually.", K(b"2")),
+        ("plan", "Make it three steps.", typed(b"3", b"Make it three steps.")),
+        ("plan", "Read me the plan.", [("say", plan)]),
+        ("trust", "Yes, I trust it.", K(b"\x1b[B") + [("wait", 0.2)] + K(b"\r")),
+        ("trust", "Banana.", [("say", "Say yes to trust this folder, or no to exit.")]),
+        ("review", "Submit.", K(b"1")),
+    ]
+    for name, text, want in cases:
+        got = dialogs.answer(menus[name], text, plan)
+        if got != want:
+            failures.append("%s %r -> %r" % (name, text, got))
+    if dialogs.answer(menus["question"], "What were the options?")[0][0] != "say":
+        failures.append("'What were the options?' did not read them again")
+    choices = {"Option two.": (2, ""), "The second one, please.": (2, ""), "First.": (1, ""),
+               "Option one, but keep the old file.": (1, "but keep the old file"),
+               "Take the first one, but rename it.": (1, "but rename it"),
+               "The first test fails.": None, "Neither, use files.": None}
+    for text, want in choices.items():
+        if dialogs.choice_of(text) != want:
+            failures.append("choice %r -> %r, expected %r" % (text, dialogs.choice_of(text), want))
+    return failures, None
+
+
+def test_dictation_tools():
+    """Fixing a draft by voice, spelled-out file names, and the project vocabulary."""
+    from hang.session import replace_in, tidy_dictation, vocabulary
+    from hang.hook import spoken_reply
+    failures = []
+    if replace_in("rename the parser and test the parser", "Replace parser with lexer.") != \
+            "rename the parser and test the lexer":
+        failures.append("replace: %r" % replace_in("rename the parser and test the parser", "Replace parser with lexer."))
+    if replace_in("rename the parser", "Change the tests to use pytest.") is not None:
+        failures.append("a prompt starting with 'change' was taken as an edit")
+    if tidy_dictation("Open session dot py and test underscore e2e") != "Open session.py and test_e2e":
+        failures.append("tidy: %r" % tidy_dictation("Open session dot py and test underscore e2e"))
+    from hang.session import live_keys, live_text
+    if live_keys("please rename the parcel", "please rename the parser and") != b"\x7f\x7f\x7fser and":
+        failures.append("live correction keys: %r" % live_keys("please rename the parcel", "please rename the parser and"))
+    if live_text("Please list the files.") != "" or \
+            live_text("Please rename the parser and then run all of the tes") != \
+            "Please rename the parser and then run all of the":
+        failures.append("live text: %r" % live_text("Please rename the parser and then run all of the tes"))
+    from hang.session import has_conversation
+    if has_conversation(os.path.join(TMP, "never-used-here")):
+        failures.append("a folder never used with Claude Code counted as having a conversation")
+    names = vocabulary(ROOT)
+    if "session" not in names or "readme" not in names or "test e2e" not in names:
+        failures.append("vocabulary: %r" % names)
+    reply = spoken_reply("## Done\nFixed **the parser** in `cli.py`.\n```py\nx = 1\n```\n| a | b |\n|---|---|\n"
+                         "See [the docs](http://x).\nVoice summary: Fixed it.")
+    if reply != "Done Fixed the parser in cli.py. (There's a code block here.) (There's a table here.) See the docs.":
+        failures.append("spoken reply: %r" % reply)
+    return failures, None
+
+
 def test_quiet():
     """"Claude, don't talk" turns spoken feedback off."""
     failures = []
@@ -332,7 +525,7 @@ def test_train_and_verify():
     wav = speech_wav("train", parts, voice=me)
     env = env_for("train", wav, HANG_COMPARISON_VOICES="Daniel,Fred,Karen,Moira",
                   HANG_COMPARISON_CACHE=os.path.join(TMP, "compare.json"))
-    r = subprocess.run([HANG, "train", "--no-start"], env=env, capture_output=True, text=True, timeout=300)
+    r = subprocess.run([HANG, "train"], env=env, capture_output=True, text=True, timeout=300)
     out = r.stdout + r.stderr
     if r.returncode != 0 or "voice trained" not in out:
         return ["training failed (exit %s): %s" % (r.returncode, out[-1500:])], env["HANG_LOG"]
@@ -354,6 +547,41 @@ def test_train_and_verify():
     if "ignored another voice" not in log:
         failures.append("other voice not logged as ignored")
     return failures, logf
+
+
+def test_speaker_tolerance():
+    """A clip just under the voice threshold still counts if it is a spoken
+    command ("Alright, we're done here." scored 0.68 against 0.69 in a real
+    session), never as dictation; far below the threshold nothing counts."""
+    from hang import audio
+    from hang.session import match_command
+    failures = []
+    audio.LOG_PATH = os.path.join(TMP, "tolerance.log")
+    audio.SOUNDS = False
+
+    class Fixed:
+        threshold = 0.69
+
+        def __init__(self, score):
+            self.s = score
+
+        def accepts(self, wav):
+            return self.s >= self.threshold, self.s
+
+    keep = lambda t: match_command(t) is not None
+    cases = [(0.68, "Alright, we're done here.", keep, "done"),        # near miss, a command: kept
+             (0.68, "Show me the readme please.", keep, None),         # near miss, dictation: dropped
+             (0.68, "Alright, we're done here.", None, None),          # no command list (service): dropped
+             (0.50, "Alright, we're done here.", keep, None),          # far below: dropped
+             (0.75, "Show me the readme please.", keep, "show me")]     # full match: kept
+    for i, (score, said, k, want) in enumerate(cases):
+        audio.VERIFIER = Fixed(score)
+        text = audio.transcribe(speech_wav("tol%d" % i, [0.3, said, 0.5]), keep=k)
+        got = (text or "").lower()
+        if (want is None) != (not got) or (want and want not in got):
+            failures.append("score %.2f, %r, keep=%s -> %r" % (score, said, bool(k), text))
+    audio.VERIFIER = None
+    return failures, audio.LOG_PATH
 
 
 # ---------------------------------------------------------------- background service
@@ -396,6 +624,38 @@ def test_wake():
     return failures, logf
 
 
+def test_wake_repeat():
+    """The service asks to repeat a folder it doesn't know, or a short sentence of
+    yours that isn't English, and then the folder name alone is enough."""
+    failures = []
+    wav = speech_wav("repeat", [0.8, ("Anna", "Bitte zeig mir alle Dateien."), 5.0, "Claude, banana.", 5.0,
+                                "The other door.", 3.0])
+    root = os.path.join(TMP, "repeat-desktop")
+    os.makedirs(os.path.join(root, "the-other-door"))
+    marker = os.path.join(TMP, "repeat-woken")
+    voiceprint = os.path.join(TMP, "repeat-voiceprint.json")
+    with open(voiceprint, "w") as f:  # a voiceprint that accepts every voice: "it's you"
+        json.dump({"threshold": -1.0, "embedding": [1.0] + [0.0] * 255}, f)
+    env = env_for("repeat", wav, HANG_WAKE_ROOT=root, HANG_WAKE_CMD="pwd >> %s" % marker, HANG_VOICEPRINT=voiceprint,
+                  PATH=fake_bin() + os.pathsep + os.environ["PATH"])
+    proc = subprocess.Popen([HANG, "service-run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    end = time.time() + 90
+    while time.time() < end and not os.path.exists(marker):
+        time.sleep(0.2)
+    time.sleep(1)
+    proc.terminate()
+    proc.wait(timeout=10)
+    log = log_of(env["HANG_WAKE_LOG"])
+    opened = open(marker).read().split() if os.path.exists(marker) else []
+    if opened != [os.path.realpath(os.path.join(root, "the-other-door"))]:
+        failures.append("opened %r, expected the-other-door after the question" % opened)
+    if "asking: \"Sorry, I didn't catch that." not in log:
+        failures.append("did not ask to repeat the German sentence")
+    if "asking: \"Sorry, there's no folder called banana." not in log:
+        failures.append("did not ask about the unknown folder")
+    return failures, env["HANG_WAKE_LOG"]
+
+
 def test_commands():
     """Spoken commands are recognized with lead-ins, tails and misheard names,
     and ordinary prompts are left alone. Includes real misses from the session log."""
@@ -411,12 +671,19 @@ def test_commands():
         "Claude, talk.": "talk", "Cloth, talk to me.": "talk",
         "How is it going?": "status", "Claude, how's it going?": "status", "So, what's the status?": "status",
         "Okay, send it.": "send", "Scratch that.": "clear", "Stop.": "escape", "Option two.": "2",
+        "Okay Claude, let's go with option 3.": "3", "Number four, please.": "4", "The second option.": "2",
         "Stop listening.": "pause", "Start listening.": "resume",
         # prompts, not commands
         "Done.": None, "Talk.": None, "Now explain the code.": None, "We're done with the parser, now the tests.": None,
         "Close the file and run the tests.": None, "Exit the loop when the list is empty.": None,
         "We're down to two failing tests.": None, "Done. Exit the loop.": None,
         "We're done. Now the tests.": None, "Please list the files in this directory.": None,
+        "First.": None, "Option two is wrong.": None, "The first test fails.": None,
+        "Plan mode.": "mode:plan mode", "Okay, switch to accept edits.": "mode:accept edits",
+        "Compact the conversation.": "slash:/compact", "Change the model.": "slash:/model",
+        "Slash review.": "slash:/review", "Read it back.": "read_back", "Delete the last sentence.": "undo",
+        "Say that again.": "repeat", "Read me the whole answer.": "read_reply",
+        "Change the parser to use regular expressions.": None, "Let's plan the migration.": None,
     }
     for said, want in cases.items():
         got = match_command(said)
@@ -425,9 +692,20 @@ def test_commands():
     from hang import session
     if os.environ.get("HANG_CMD", "claude") == "claude" and session.SEND != b"\x18\x13":
         failures.append("prompts are not sent with Claude Code's send-now keys (Ctrl+X Ctrl+S)")
-    from hang.wake import wake_target
-    if wake_target("Claude, exit.") or wake_target("Okay Claude, we're done here."):
+    from hang import wake
+    wake.WAKE_ROOT = os.path.join(TMP, "commands-desktop")
+    os.makedirs(os.path.join(wake.WAKE_ROOT, "the-other-door"))
+    door = ("open", os.path.join(wake.WAKE_ROOT, "the-other-door"))
+    if wake.wake_target("Claude, exit.") or wake.wake_target("Okay Claude, we're done here."):
         failures.append("the wake service treated a 'done' phrase as a folder")
+    wake_cases = [("Claude, the other door.", False, door),
+                  ("Claude, continue the other door.", False, door), ("Claude, resume the other door.", False, door), ("The other door.", False, None),
+                  ("The other door.", True, door), ("Claude, pong.", False, "ask"), ("Claude.", False, "ask"),
+                  ("We should go to the cloud.", False, None), ("Pong.", True, "ask")]
+    for said, replying, want in wake_cases:
+        got = wake.wake_target(said, replying)
+        if (got and got[0]) != want and got != want:
+            failures.append("wake %r (replying=%s) -> %r, expected %r" % (said, replying, got, want))
     return failures, None
 
 
@@ -485,8 +763,10 @@ def test_hook_notes():
     return failures, None
 
 
-TESTS = [test_commands, test_hook_notes, test_ptt, test_conversation, test_amm, test_english_only, test_done,
-         test_one_listener, test_speak, test_quiet, test_train_and_verify, test_wake]
+TESTS = [test_commands, test_hook_notes, test_dialogs, test_dictation_tools, test_ptt, test_conversation, test_amm,
+         test_live, test_english_only, test_done,
+         test_one_listener, test_speak, test_choices, test_quiet, test_train_and_verify,
+         test_speaker_tolerance, test_wake, test_wake_repeat]
 
 def run_one(name):
     """Run one test in this process; print its result; exit status = failed."""

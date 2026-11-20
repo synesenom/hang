@@ -14,8 +14,11 @@ it speaks so Claude's voice is not transcribed back into the prompt.
                              progress, in its own words); routine steps are
                              silent, but their phase and the step itself
                              ("Reading cli.") are kept for "How is it going?"
-  python -m hang.hook stop     Stop: speak that summary line
-  python -m hang.hook notify   Notification: speak it (e.g. a permission request)
+  python -m hang.hook stop     Stop: speak that summary line, and keep the whole
+                             reply for "read me the whole answer"
+
+Dialogs (questions, permission prompts, the plan) are not spoken from here: the
+session reads them off the screen, options and all (hang.screen, hang.dialogs).
 
 Progress (phase, last step, latest update, summary) is kept in status.json next
 to the FIFO, which the session reads when asked "How is it going?".
@@ -72,7 +75,8 @@ def read_status():
 
 
 def write_status(**changes):
-    """Merge changes into status.json: working, phase, last, update, updates_said, summary."""
+    """Merge changes into status.json: working, phase, last, update, updates_said,
+    summary, reply."""
     path = status_path()
     if not path:
         return
@@ -159,6 +163,28 @@ def summary(text):
     return first[:200] if first else "Done."
 
 
+def spoken_reply(text):
+    """Claude's whole reply as plain speech: no markdown, code blocks and tables
+    summed up in a word, no voice lines."""
+    text = re.sub(r"```.*?(```|$)", " (There's a code block here.) ", text or "", flags=re.S)
+    rows = []
+    for row in text.splitlines():
+        low = row.lower()
+        if TAG.lower() in low or UPDATE.lower() in low:
+            continue
+        if re.match(r"^\s*\|", row):
+            if not rows or rows[-1] != "(There's a table here.)":
+                rows.append("(There's a table here.)")
+            continue
+        rows.append(row)
+    plain = "\n".join(rows)
+    plain = re.sub(r"`([^`]*)`", r"\1", plain)
+    plain = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", plain)
+    plain = re.sub(r"^\s*#+\s*|[*_>]+", "", plain, flags=re.M)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain[:6000]
+
+
 def file_name(path):
     """'/x/tests/test_e2e.py' -> 'test e2e': how a person would say it."""
     name = os.path.splitext(os.path.basename(path or ""))[0] or os.path.basename(path or "")
@@ -198,11 +224,9 @@ def describe(tool, inp):
     if tool == "Skill":
         return "Using the %s skill." % (inp.get("skill") or inp.get("command") or "a"), False
     if tool == "AskUserQuestion":
-        qs = inp.get("questions") or []
-        q = qs[0].get("question") if qs and isinstance(qs[0], dict) else ""
-        return "I have a question. %s" % q, True
+        return "Asking you a question.", False  # the session reads it off the screen
     if tool == "ExitPlanMode":
-        return "The plan is ready for you to review.", True
+        return "Showing you the plan.", False  # read off the screen, with its options
     if tool.startswith("Todo") or tool.startswith("Task"):
         return None  # bookkeeping, not worth saying
     if tool.startswith("mcp__"):
@@ -283,18 +307,15 @@ def main():
     if what == "prompt":
         write_status(working=True, phase=None, last=None, update=None, updates_said=0)
         speak("Working on it.")
-        print(INSTRUCTION)  # UserPromptSubmit: stdout is added to Claude's context
+        if os.environ.get("HANG_SPEAK", "1") == "1":
+            print(INSTRUCTION)  # UserPromptSubmit: stdout is added to Claude's context
     elif what == "tool":
         on_tool(event)
     elif what == "stop":
-        said = summary(last_assistant_text(event))
-        write_status(working=False, summary=said)
+        text = last_assistant_text(event)
+        said = summary(text)
+        write_status(working=False, summary=said, reply=spoken_reply(text))
         speak(said, urgent=True)
-    elif what == "notify":
-        # Only permission requests; "waiting for your input" would nag after every reply.
-        message = event.get("message", "")
-        if event.get("notification_type") == "permission_prompt" or "permission" in message.lower():
-            speak(message, urgent=True)
 
 
 if __name__ == "__main__":

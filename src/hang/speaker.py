@@ -57,6 +57,24 @@ def read_wav(path):
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def trim(samples, frame=480, rel=0.1, pad=3):
+    """Drop the quiet start and end of a clip. A live utterance carries 0.3 s
+    before onset and a full pause after it: on a short phrase ("Claude, hang")
+    that is more silence than speech, and the voice score drops below the
+    threshold. Keeps frames from the first to the last one louder than `rel`
+    of the loudest, plus `pad` frames (90 ms) either side."""
+    import numpy as np
+    n = len(samples) // frame
+    if n < 2:
+        return samples
+    rms = np.sqrt(np.mean(samples[:n * frame].reshape(n, frame) ** 2, axis=1))
+    loud = np.nonzero(rms >= rel * rms.max())[0]
+    if not len(loud):
+        return samples
+    a, b = max(0, loud[0] - pad), min(n, loud[-1] + 1 + pad)
+    return samples[a * frame:b * frame]
+
+
 def embed(ex, samples):
     import numpy as np
     stream = ex.create_stream()
@@ -97,7 +115,7 @@ def comparison_embeddings(ex, on_voice=lambda name: None):
                 continue
             subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", aiff, "-ar", str(RATE), "-ac", "1", wav],
                            check=True)
-            voices[name] = embed(ex, read_wav(wav))
+            voices[name] = embed(ex, trim(read_wav(wav)))
     finally:
         for f in os.listdir(tmp):
             os.unlink(os.path.join(tmp, f))
@@ -175,7 +193,7 @@ class Verifier:
         return v
 
     def score(self, wav_path):
-        return float(embed(self.extractor, read_wav(wav_path)) @ self.voiceprint)
+        return float(embed(self.extractor, trim(read_wav(wav_path))) @ self.voiceprint)
 
     def accepts(self, wav_path):
         s = self.score(wav_path)

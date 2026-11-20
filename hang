@@ -11,5 +11,9 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ ! -x "$repo/.venv/bin/python" ]; then
   HANG_BOOTSTRAP_ONLY=1 "$repo/setup.sh"
+elif [ "$repo/poetry.lock" -nt "$repo/.venv/.hang-installed" ]; then
+  # New or changed Python packages since the last install (after an update).
+  echo "Updating Python packages…" >&2
+  poetry -C "$repo" install --no-root >/dev/null && touch "$repo/.venv/.hang-installed"
 fi
 PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}" exec poetry -C "$repo" run python -m hang "$@"

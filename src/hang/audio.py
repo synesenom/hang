@@ -6,14 +6,18 @@ transcribes it on-device, temp WAVs are deleted immediately.
 """
 import array
 import collections
+import json
 import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
+import uuid
 import wave
 from contextlib import contextmanager
 
@@ -35,6 +39,9 @@ MIC = os.environ.get("HANG_MIC", "default")
 SILENCE_MS = int(os.environ.get("HANG_SILENCE_MS", "1000"))
 MIN_LEVEL = float(os.environ.get("HANG_MIN_LEVEL", "250"))
 SOUNDS = os.environ.get("HANG_SOUNDS", "1") == "1"
+# How far below the voice threshold a spoken command may score and still count
+# (only in a session, only for commands; see transcribe).
+SPEAKER_TOLERANCE = float(os.environ.get("HANG_SPEAKER_TOLERANCE", "0.08"))
 TEST_WAV = os.environ.get("HANG_TEST_WAV", "")
 # Each entry point points this at its own log (session, service, training).
 LOG_PATH = os.environ.get("HANG_LOG", os.path.join(tempfile.gettempdir(), "hang.log"))
@@ -76,6 +83,112 @@ def check_tools():
 
 # ---------------------------------------------------------------- transcription
 
+class WhisperServer:
+    """whisper.cpp's whisper-server, running for the length of a session: the
+    model stays loaded, so a sentence takes ~0.1 s instead of ~0.4 s, which
+    also makes typing while you talk possible. It listens on 127.0.0.1 only;
+    until it is ready (or if it fails) whisper-cli is used instead."""
+
+    def __init__(self):
+        self.proc = None
+        self.url = None
+        self.ready = False
+
+    def start(self):
+        if not shutil.which("whisper-server"):
+            return
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        cmd = ["whisper-server", "-m", MODEL, "--host", "127.0.0.1", "--port", str(port), "-l", LANG, "-nt"]
+        if os.path.exists(VAD_MODEL):
+            cmd += ["--vad", "-vm", VAD_MODEL]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+        self.url = "http://127.0.0.1:%d/inference" % port
+        threading.Thread(target=self._wait, daemon=True).start()
+
+    def _wait(self):
+        for _ in range(100):
+            if not self.proc or self.proc.poll() is not None:
+                log("whisper server did not start; using whisper-cli")
+                return
+            try:
+                urllib.request.urlopen(self.url.rsplit("/", 1)[0] + "/", timeout=1).read()
+                self.ready = True
+                log("whisper server ready")
+                return
+            except OSError:
+                time.sleep(0.1)
+
+    def stop(self):
+        proc, self.proc, self.ready = self.proc, None, False
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def transcribe(self, wav, prompt=None):
+        """The text, or None if the server could not do it."""
+        boundary = uuid.uuid4().hex
+        fields = [("response_format", "json"), ("temperature", "0.0")] + ([("prompt", prompt)] if prompt else [])
+        body = b""
+        for name, value in fields:
+            body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                     % (boundary, name, value)).encode()
+        with open(wav, "rb") as f:
+            body += ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
+                     "Content-Type: audio/wav\r\n\r\n" % boundary).encode() + f.read() + b"\r\n"
+        body += ("--%s--\r\n" % boundary).encode()
+        req = urllib.request.Request(self.url, data=body,
+                                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode()).get("text", "")
+        except (OSError, ValueError) as e:
+            log("whisper server failed (%s); using whisper-cli" % e)
+            return None
+
+
+SERVER = WhisperServer()
+
+
+def run_whisper(wav, prompt=None):
+    """Transcribe with the server if it is up, else whisper-cli. None on failure."""
+    prompt = prompt or PROMPT
+    if SERVER.ready:
+        text = SERVER.transcribe(wav, prompt)
+        if text is not None:
+            return clean_transcript(text)
+    cmd = ["whisper-cli", "-m", MODEL, "-f", wav, "-l", LANG, "-nt", "-np"]
+    if os.path.exists(VAD_MODEL):
+        # Silero VAD drops non-speech (keyboard, coughs) so whisper does not
+        # hallucinate text from noise.
+        cmd += ["--vad", "-vm", VAD_MODEL]
+    if prompt:
+        cmd += ["--prompt", prompt]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        log("whisper-cli failed: %s" % out.stderr.strip()[-500:])
+        return None
+    return clean_transcript(out.stdout)
+
+
+def voice_ok(wav):
+    """Is this clip your voice (if there is a voiceprint) and English? For text
+    typed while you are still talking, before the full checks at the end."""
+    if VERIFIER:
+        try:
+            if not VERIFIER.accepts(wav)[0]:
+                return False
+        except Exception:
+            pass
+    lang = detect_language(wav)
+    return not (lang and lang[0] != "en" and lang[1] >= LANGID_MIN_P)
+
+
 NOISE = re.compile(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*")  # [BLANK_AUDIO], (music), *sigh*
 HALLUCINATIONS = {"you", "thank you", "thanks for watching", "bye", ""}
 
@@ -113,20 +226,34 @@ def detect_language(wav):
     return (m.group(1), float(m.group(2))) if m else None
 
 
-def transcribe(wav, prompt=None, keep=None, beep=False):
+def transcribe(wav, prompt=None, keep=None, beep=False, on_foreign=None):
     """Text of the clip, or None if it is another voice, not English, or empty.
     keep(text): kept even if it sounds foreign (default: addressed to Claude;
     a session passes its spoken commands, as names and short words fool the
     language check). beep: play a sound when a clip is dropped as not English
-    (in a session; the background service hears too much ambient speech)."""
+    (in a session). on_foreign(seconds): called with the clip's length when it
+    is dropped as not English (the background service asks to repeat).
+    A clip that misses the voice threshold by less than SPEAKER_TOLERANCE is
+    still transcribed when keep is given, and kept only if keep(text): short
+    commands ("We're done.") score a little below the long sentences you
+    trained on, while dictation still needs a full voice match."""
+    try:
+        seconds = max(0, os.path.getsize(wav) - 44) / (2.0 * RATE)
+    except OSError:
+        seconds = 0.0
+    near_miss = None  # score of a clip let through on tolerance, commands only
     if VERIFIER:
         try:
             ok, score = VERIFIER.accepts(wav)
         except Exception as e:
             ok, score = True, 0.0
             log("speaker check failed, accepting: %s" % e)
-        if not ok:
+        if not ok and keep and score >= VERIFIER.threshold - SPEAKER_TOLERANCE:
+            near_miss = score
+        elif not ok:
             log("ignored another voice (score %.2f < %.2f)" % (score, VERIFIER.threshold))
+            if beep:
+                sound("Funk")  # so you know it was heard and not sent
             os.unlink(wav)
             return None
     # Language detection is unreliable on clips built around a name ("Claude,
@@ -134,30 +261,30 @@ def transcribe(wav, prompt=None, keep=None, beep=False):
     # verdict drops speech unless keep() says it is a command.
     lang = detect_language(wav)
     foreign = bool(lang and lang[0] != "en" and lang[1] >= LANGID_MIN_P)
-    cmd = ["whisper-cli", "-m", MODEL, "-f", wav, "-l", LANG, "-nt", "-np"]
-    if os.path.exists(VAD_MODEL):
-        # Silero VAD drops non-speech (keyboard, coughs) so whisper does not
-        # hallucinate text from noise.
-        cmd += ["--vad", "-vm", VAD_MODEL]
-    if prompt or PROMPT:
-        cmd += ["--prompt", prompt or PROMPT]
     t0 = time.time()
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        text = run_whisper(wav, prompt)
     finally:
         try:
             os.unlink(wav)  # never keep the audio around
         except OSError:
             pass
-    if out.returncode != 0:
-        log("whisper-cli failed: %s" % out.stderr.strip()[-500:])
+    if text is None:
         return None
-    text = clean_transcript(out.stdout)
     heard = " [%s %.2f]" % lang if lang else ""
+    if near_miss is not None:
+        if not (text and keep(text)):
+            log("ignored another voice (score %.2f < %.2f, not a command)" % (near_miss, VERIFIER.threshold))
+            if beep:
+                sound("Funk")
+            return None
+        log("kept a command despite voice score %.2f < %.2f" % (near_miss, VERIFIER.threshold))
     if foreign and text and not (keep or addressed)(text):
         log("ignored non-English speech (%s, p=%.2f)" % lang)
         if beep:
             sound("Funk")  # so you know it was not sent
+        if on_foreign:
+            on_foreign(seconds)
         return None
     if foreign and text:
         log("kept despite language check (%s, p=%.2f): a command" % lang)
@@ -271,12 +398,18 @@ class Listener:
     """Hands-free: streams the mic, segments speech with an adaptive energy
     gate, and hands each utterance (as a temp WAV) to `on_utterance`."""
 
-    def __init__(self, on_utterance, on_state, on_level=None):
+    def __init__(self, on_utterance, on_state, on_level=None, on_partial=None, partial_ms=1000):
         self.on_utterance = on_utterance
+        # on_partial(utterance, pcm): the speech so far, every partial_ms while
+        # someone is talking (for typing while you talk). utterance counts up.
+        self.on_partial = on_partial
+        self.partial_ms = partial_ms
+        self.utterance = 0
         self.on_state = on_state
         self.on_level = on_level  # (rms, speech threshold) every 30 ms, for level meters
         self.proc = None
         self.thread = None
+        self.muted = False  # keep the stream open but ignore it (while we speak)
 
     @property
     def active(self):
@@ -314,6 +447,12 @@ class Listener:
                 return
             if proc is not self.proc:
                 return
+            if self.muted:
+                if in_speech:
+                    self.on_state("listening")
+                in_speech, loud_run, speech = False, 0, []
+                preroll.clear()
+                continue
             samples = array.array("h", chunk)
             rms = math.sqrt(sum(s * s for s in samples) / FRAME)
             if floor is None:
@@ -329,6 +468,7 @@ class Listener:
                     loud_run += 1
                     if loud_run >= 3:  # 90 ms of sound: speech onset
                         in_speech = True
+                        self.utterance += 1
                         speech = list(preroll)
                         voiced, quiet_ms = loud_run, 0
                         self.on_state("hearing")
@@ -338,6 +478,8 @@ class Listener:
                 continue
 
             speech.append(chunk)
+            if self.on_partial and len(speech) % (self.partial_ms // FRAME_MS) == 0 and quiet_ms < 300:
+                self.on_partial(self.utterance, b"".join(speech))
             if rms > end_th:
                 voiced += 1
                 quiet_ms = 0
