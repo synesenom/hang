@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#
+# ./hang [command] — talk to Claude Code by voice, locally (`./hang --help`).
+#
+# Runs `python -m hang` in the project's Poetry environment with src/ on
+# PYTHONPATH (the package lives in src/hang/ and is never installed). The first
+# time, ./setup.sh creates that environment.
+#
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ ! -x "$repo/.venv/bin/python" ]; then
+  HANG_BOOTSTRAP_ONLY=1 "$repo/setup.sh"
+fi
+PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}" exec poetry -C "$repo" run python -m hang "$@"

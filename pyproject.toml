@@ -1,0 +1,14 @@
+[project]
+name = "hang"
+version = "0.1.0"
+description = "Local, hands-free voice input and spoken feedback for Claude Code"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "sherpa-onnx (>=1.12,<2.0)",  # speaker verification (only you can talk to Claude)
+    "numpy (>=2.0,<3.0)",
+    "click (>=8.5.1,<9.0.0)",
+    "rich (>=15.0.0,<16.0.0)",
+]
+
+[tool.poetry]
+package-mode = false  # plain scripts, nothing to build
